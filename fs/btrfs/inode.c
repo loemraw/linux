@@ -2271,7 +2271,7 @@ error:
 		extent_clear_unlock_delalloc(inode, untouched_start, untouched_end,
 					     locked_folio, &cached,
 					     EXTENT_LOCKED | EXTENT_DELALLOC |
-					     EXTENT_DEFRAG |
+					     EXTENT_DELALLOC_NEW | EXTENT_DEFRAG |
 					     EXTENT_DO_ACCOUNTING, PAGE_UNLOCK |
 					     PAGE_START_WRITEBACK |
 					     PAGE_END_WRITEBACK);
