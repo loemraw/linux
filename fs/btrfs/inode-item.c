@@ -464,7 +464,6 @@ int btrfs_truncate_inode_items(struct btrfs_trans_handle *trans,
 	ASSERT(control->inode || !control->clear_extent_range);
 	ASSERT(new_size == 0 || control->min_type == BTRFS_EXTENT_DATA_KEY);
 
-	control->last_size = new_size;
 	control->sub_bytes = 0;
 
 	/*
@@ -636,7 +635,8 @@ delete:
 			ASSERT(!pending_del_nr ||
 			       ((path->slots[0] + 1) == pending_del_slot));
 
-			control->last_size = found_key.offset;
+			control->last_size = min(control->last_size,
+						 found_key.offset);
 			if (!pending_del_nr) {
 				/* No pending yet, add ourselves */
 				pending_del_slot = path->slots[0];

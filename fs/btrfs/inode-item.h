@@ -35,7 +35,16 @@ struct btrfs_truncate_control {
 	/* OUT: the number of extents truncated. */
 	u64 extents_found;
 
-	/* OUT: the last size we truncated this inode to. */
+	/*
+	 * IN/OUT: the size down to which file extent items have been removed.
+	 *
+	 * Callers that restore i_size after a failed truncate initialize this
+	 * to the size before the truncate, all others to new_size. It is only
+	 * ever lowered: to the offset of each item queued for deletion, and to
+	 * new_size when the item straddling new_size is trimmed and on success.
+	 * It is not reset between calls, so it stays valid across the restarts
+	 * of a truncate.
+	 */
 	u64 last_size;
 
 	/* OUT: the number of bytes to sub from this inode. */
