@@ -5455,23 +5455,28 @@ process:
 	 * before it commits and wipes out the log trees, otherwise we would
 	 * lose data if an ordered extents completes after the transaction
 	 * commits and a power failure happens after the transaction commit.
+	 *
+	 * A failed ordered extent keeps its extent allocated only if it sees
+	 * BTRFS_ORDERED_LOGGED. It sets BTRFS_ORDERED_IOERR before checking, so
+	 * if we see IOERR here it may have already freed the extent, and this
+	 * log must not be synced.
 	 */
 	list_for_each_entry_safe(ordered, tmp, &ctx->ordered_extents, log_list) {
 		list_del_init(&ordered->log_list);
-		set_bit(BTRFS_ORDERED_LOGGED, &ordered->flags);
 
+		spin_lock(&inode->ordered_tree_lock);
+		set_bit(BTRFS_ORDERED_LOGGED, &ordered->flags);
+		if (test_bit(BTRFS_ORDERED_IOERR, &ordered->flags))
+			ret = -EIO;
 		if (!test_bit(BTRFS_ORDERED_COMPLETE, &ordered->flags)) {
-			spin_lock(&inode->ordered_tree_lock);
-			if (!test_bit(BTRFS_ORDERED_COMPLETE, &ordered->flags)) {
-				set_bit(BTRFS_ORDERED_PENDING, &ordered->flags);
-				atomic_inc(&trans->transaction->pending_ordered);
-			}
-			spin_unlock(&inode->ordered_tree_lock);
+			set_bit(BTRFS_ORDERED_PENDING, &ordered->flags);
+			atomic_inc(&trans->transaction->pending_ordered);
 		}
+		spin_unlock(&inode->ordered_tree_lock);
 		btrfs_put_ordered_extent(ordered);
 	}
 
-	return 0;
+	return ret;
 }
 
 static int get_inode_size_to_log(struct btrfs_trans_handle *trans,
