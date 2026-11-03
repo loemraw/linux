@@ -1524,6 +1524,42 @@ static inline bool skip_inode_logging(const struct btrfs_log_ctx *ctx)
 }
 
 /*
+ * Wait for the IO of the ordered extents collected for logging to be done, and
+ * return true if a COW write among them failed.
+ *
+ * Waiting for writeback is not enough to know that: the end IO handlers clear
+ * writeback before they account the IO in the ordered extent. An ordered
+ * extent gets BTRFS_ORDERED_IO_DONE only once all of its IO is accounted, and
+ * can_finish_ordered_extent() sets BTRFS_ORDERED_IOERR before that.
+ */
+static bool cow_write_failed(struct btrfs_inode *inode,
+			     struct list_head *ordered_extents)
+{
+	struct btrfs_ordered_extent *ordered;
+	bool failed = false;
+
+	list_for_each_entry(ordered, ordered_extents, log_list)
+		wait_event(ordered->wait,
+			   test_bit(BTRFS_ORDERED_IO_DONE, &ordered->flags));
+
+	/*
+	 * can_finish_ordered_extent() records a write error before it sets
+	 * BTRFS_ORDERED_IO_DONE, both under this lock.
+	 */
+	spin_lock(&inode->ordered_tree_lock);
+	list_for_each_entry(ordered, ordered_extents, log_list) {
+		if (test_bit(BTRFS_ORDERED_IOERR, &ordered->flags) &&
+		    !test_bit(BTRFS_ORDERED_NOCOW, &ordered->flags)) {
+			failed = true;
+			break;
+		}
+	}
+	spin_unlock(&inode->ordered_tree_lock);
+
+	return failed;
+}
+
+/*
  * fsync call for both files and directories.  This logs the inode into
  * the tree log instead of forcing full commits whenever possible.
  *
@@ -1626,7 +1662,7 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	 * IO of a lower priority task while holding a transaction open.
 	 *
 	 * For a full fsync we wait for the ordered extents to complete while
-	 * for a fast fsync we wait just for writeback to complete, and then
+	 * for a fast fsync we wait just for their IO to complete, and then
 	 * attach the ordered extents to the transaction so that a transaction
 	 * commit waits for their completion, to avoid data loss if we fsync,
 	 * the current transaction commits before the ordered extents complete
@@ -1638,7 +1674,6 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	 */
 	if (full_sync || btrfs_is_zoned(fs_info)) {
 		ret = btrfs_wait_ordered_range(inode, start, len);
-		clear_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags);
 	} else {
 		/*
 		 * Get our ordered extents as soon as possible to avoid doing
@@ -1651,15 +1686,12 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 			goto out_release_extents;
 
 		/*
-		 * Check and clear the BTRFS_INODE_COW_WRITE_ERROR now after
-		 * starting and waiting for writeback, because for buffered IO
-		 * it may have been set during the end IO callback
-		 * (end_bbio_data_write() -> btrfs_finish_ordered_extent()) in
-		 * case an error happened and we need to wait for ordered
-		 * extents to complete so that any extent maps that point to
-		 * unwritten locations are dropped and we don't log them.
+		 * If a COW write failed, before submitting a bio or during IO,
+		 * the extent maps of its range point to unwritten locations
+		 * until the ordered extent completes and drops them. Wait for
+		 * that, so that we don't log them.
 		 */
-		if (test_and_clear_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags))
+		if (cow_write_failed(inode, &ctx.ordered_extents))
 			ret = btrfs_wait_ordered_range(inode, start, len);
 	}
 
