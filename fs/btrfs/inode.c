@@ -3171,6 +3171,30 @@ static int insert_ordered_extent_file_extent(struct btrfs_trans_handle *trans,
 }
 
 /*
+ * The log may already reference this extent, so keep it out of the free space
+ * cache until log replay at the next mount.
+ *
+ * The transaction that logged it must not commit either, since that would drop
+ * the log. Every failure after joining it aborts it, and a failed join means it
+ * already aborted or the filesystem already has an error, unless allocating
+ * the handle failed. In that case set the error here, so the commit fails to
+ * write its tree blocks and never writes a superblock.
+ */
+static void keep_logged_extent(struct btrfs_ordered_extent *oe, int error)
+{
+	struct btrfs_fs_info *fs_info = oe->inode->root->fs_info;
+	struct btrfs_block_group *bg;
+
+	if (!BTRFS_FS_ERROR(fs_info))
+		btrfs_handle_fs_error(fs_info, error, NULL);
+
+	bg = btrfs_lookup_block_group(fs_info, oe->disk_bytenr);
+	ASSERT(bg);
+	btrfs_free_reserved_bytes(bg, oe->disk_num_bytes, true);
+	btrfs_put_block_group(bg);
+}
+
+/*
  * As ordered data IO finishes, this gets called so we can finish
  * an ordered extent if the range of bytes in the file it covers are
  * fully written.
@@ -3373,18 +3397,31 @@ out:
 		    clear_reserved_extent &&
 		    !test_bit(BTRFS_ORDERED_NOCOW, &ordered_extent->flags) &&
 		    !test_bit(BTRFS_ORDERED_PREALLOC, &ordered_extent->flags)) {
+			const u64 disk_bytenr = ordered_extent->disk_bytenr;
+			const u64 disk_num_bytes = ordered_extent->disk_num_bytes;
+			bool logged;
+
 			/*
-			 * Discard the range before returning it back to the
-			 * free space pool
+			 * A fast fsync may have logged this extent. Pairs with
+			 * the end of btrfs_log_changed_extents().
 			 */
-			if (ret && btrfs_test_opt(fs_info, DISCARD_SYNC))
-				btrfs_discard_extent(fs_info,
-						ordered_extent->disk_bytenr,
-						ordered_extent->disk_num_bytes,
-						NULL, true);
-			btrfs_free_reserved_extent(fs_info,
-					ordered_extent->disk_bytenr,
-					ordered_extent->disk_num_bytes, true);
+			spin_lock(&inode->ordered_tree_lock);
+			logged = test_bit(BTRFS_ORDERED_LOGGED, &ordered_extent->flags);
+			spin_unlock(&inode->ordered_tree_lock);
+
+			if (ret && logged) {
+				keep_logged_extent(ordered_extent, ret);
+			} else {
+				/*
+				 * Discard the range before returning it back to
+				 * the free space pool
+				 */
+				if (ret && btrfs_test_opt(fs_info, DISCARD_SYNC))
+					btrfs_discard_extent(fs_info, disk_bytenr,
+							     disk_num_bytes, NULL, true);
+				btrfs_free_reserved_extent(fs_info, disk_bytenr,
+							   disk_num_bytes, true);
+			}
 			/*
 			 * Actually free the qgroup rsv which was released when
 			 * the ordered extent was created.
