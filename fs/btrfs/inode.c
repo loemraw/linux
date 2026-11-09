@@ -116,7 +116,8 @@ static const struct file_operations btrfs_dir_file_operations;
 static struct kmem_cache *btrfs_inode_cachep;
 
 static int btrfs_setsize(struct inode *inode, struct iattr *attr);
-static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback);
+static int btrfs_truncate(struct btrfs_inode *inode, u64 oldsize,
+			  bool skip_writeback);
 
 static noinline int run_delalloc_cow(struct btrfs_inode *inode,
 				     struct folio *locked_folio, u64 start,
@@ -2270,7 +2271,7 @@ error:
 		extent_clear_unlock_delalloc(inode, untouched_start, untouched_end,
 					     locked_folio, &cached,
 					     EXTENT_LOCKED | EXTENT_DELALLOC |
-					     EXTENT_DEFRAG |
+					     EXTENT_DELALLOC_NEW | EXTENT_DEFRAG |
 					     EXTENT_DO_ACCOUNTING, PAGE_UNLOCK |
 					     PAGE_START_WRITEBACK |
 					     PAGE_END_WRITEBACK);
@@ -5406,21 +5407,8 @@ static int btrfs_setsize(struct inode *inode, struct iattr *attr)
 
 		inode_dio_wait(inode);
 
-		ret = btrfs_truncate(BTRFS_I(inode), newsize == oldsize);
-		if (ret && inode->i_nlink) {
-			int ret2;
-
-			/*
-			 * Truncate failed, so fix up the in-memory size. We
-			 * adjusted disk_i_size down as we removed extents, so
-			 * wait for disk_i_size to be stable and then update the
-			 * in-memory size to match.
-			 */
-			ret2 = btrfs_wait_ordered_range(BTRFS_I(inode), 0, (u64)-1);
-			if (ret2)
-				return ret2;
-			i_size_write(inode, BTRFS_I(inode)->disk_i_size);
-		}
+		ret = btrfs_truncate(BTRFS_I(inode), oldsize,
+				     newsize == oldsize);
 	}
 
 	return ret;
@@ -5645,6 +5633,7 @@ void btrfs_evict_inode(struct inode *inode)
 			.inode = BTRFS_I(inode),
 			.ino = btrfs_ino(BTRFS_I(inode)),
 			.new_size = 0,
+			.last_size = 0,
 			.min_type = 0,
 		};
 
@@ -7791,7 +7780,102 @@ next:
 	clear_folio_extent_mapped(folio);
 }
 
-static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback)
+/*
+ * A truncate failed after truncate_setsize() set i_size to @new_size, but file
+ * extent items were only removed down to @last_size. Raise i_size back over
+ * them: items left beyond EOF have their bytes counted again in nbytes by a
+ * later write starting at EOF, or with NO_HOLES by an extending truncate.
+ */
+static void btrfs_truncate_restore_size(struct btrfs_inode *inode,
+					u64 new_size, u64 last_size)
+{
+	struct btrfs_root *root = inode->root;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct address_space *mapping = inode->vfs_inode.i_mapping;
+	struct btrfs_trans_handle *trans;
+	const u64 start = round_up(new_size, fs_info->sectorsize);
+	u64 size = last_size;
+
+	/*
+	 * Without NO_HOLES every range below i_size needs a file extent item,
+	 * but truncate_setsize() dropped dirty pages beyond new_size which may
+	 * never have been written and have none. disk_i_size can't advance past
+	 * such a range, so stop at the first one, once ordered extents that may
+	 * still insert items in the range have completed.
+	 */
+	if (inode->file_extent_tree && last_size > start) {
+		const u64 end = round_up(last_size, fs_info->sectorsize) - 1;
+		struct extent_state *cached_state = NULL;
+		u64 covered_end = start;
+		u64 found_start;
+		u64 found_end;
+
+		btrfs_lock_and_flush_ordered_range(inode, start, end, &cached_state);
+		if (btrfs_find_contiguous_extent_bit(inode->file_extent_tree, start,
+						     &found_start, &found_end,
+						     EXTENT_DIRTY) &&
+		    found_start <= start)
+			covered_end = found_end + 1;
+		btrfs_unlock_extent(&inode->io_tree, start, end, &cached_state);
+
+		if (covered_end < last_size)
+			size = (covered_end > start) ? covered_end : new_size;
+	}
+
+	/*
+	 * Update i_size first, ordered extent completions recompute disk_i_size
+	 * from it and must not cap it at new_size again.
+	 */
+	i_size_write(&inode->vfs_inode, size);
+	btrfs_inode_safe_disk_i_size_write(inode, 0);
+	pagecache_isize_extended(&inode->vfs_inode, new_size, size);
+
+	if (size > new_size) {
+		pgoff_t first = new_size >> PAGE_SHIFT;
+		struct folio *folio;
+
+		/*
+		 * The truncate loop dropped the extent maps beyond new_size,
+		 * including ones in the list of modified extents, so a fast
+		 * fsync would miss new extents in the range just restored.
+		 */
+		btrfs_set_inode_full_sync(inode);
+
+		/*
+		 * truncate_setsize() zeroed the cached EOF folio beyond
+		 * new_size, and reads that raced with the truncate may have
+		 * cached zeroed folios beyond it. Drop them so the restored
+		 * range is read from disk again. This is best effort: dirty,
+		 * mapped, locked or otherwise busy folios are kept. It must
+		 * come after raising i_size, as reads zero folios beyond i_size.
+		 * Start at the EOF folio, which may begin before new_size.
+		 */
+		folio = filemap_get_folio(mapping, first);
+		if (!IS_ERR(folio)) {
+			first = folio->index;
+			folio_put(folio);
+		}
+		invalidate_mapping_pages(mapping, first, (size - 1) >> PAGE_SHIFT);
+	}
+
+	/*
+	 * Ordered extent completions may have written new_size to the inode
+	 * item, and the failed truncate may have changed nbytes or disk_i_size
+	 * without updating it. Nothing on this failure path updates it, so do it
+	 * here, otherwise evicting the inode loses the restored size. Like
+	 * unlink, allow using the global reserve and exceeding the qgroup limit,
+	 * since failing to reserve space may be why the truncate failed. This is
+	 * best effort, the truncate's error is returned either way.
+	 */
+	trans = btrfs_start_transaction_fallback_global_rsv(root, 1);
+	if (IS_ERR(trans))
+		return;
+	btrfs_update_inode(trans, inode);
+	btrfs_end_transaction(trans);
+}
+
+static int btrfs_truncate(struct btrfs_inode *inode, u64 oldsize,
+			  bool skip_writeback)
 {
 	struct btrfs_truncate_control control = {
 		.inode = inode,
@@ -7799,6 +7883,7 @@ static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback)
 		.min_type = BTRFS_EXTENT_DATA_KEY,
 		.clear_extent_range = true,
 		.new_size = inode->vfs_inode.i_size,
+		.last_size = oldsize,
 	};
 	struct btrfs_root *root = inode->root;
 	struct btrfs_fs_info *fs_info = root->fs_info;
@@ -7811,12 +7896,6 @@ static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback)
 
 	/* Our inode is locked and the i_size can't be changed concurrently. */
 	btrfs_assert_inode_locked(inode);
-
-	if (!skip_writeback) {
-		ret = btrfs_wait_ordered_range(inode, lock_start, (u64)-1);
-		if (ret)
-			return ret;
-	}
 
 	/*
 	 * Yes ladies and gentlemen, this is indeed ugly.  We have a couple of
@@ -7849,6 +7928,12 @@ static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback)
 	btrfs_init_metadata_block_rsv(fs_info, &rsv, BTRFS_BLOCK_RSV_TEMP);
 	rsv.size = min_size;
 	rsv.failfast = true;
+
+	if (!skip_writeback) {
+		ret = btrfs_wait_ordered_range(inode, lock_start, (u64)-1);
+		if (ret)
+			goto out;
+	}
 
 	/*
 	 * 1 for the truncate slack space
@@ -7939,6 +8024,13 @@ static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback)
 					   inode->vfs_inode.i_size, (u64)-1);
 		if (ret)
 			goto out;
+		/*
+		 * Everything beyond the new size is gone except the encoded
+		 * inline extent straddling it, whose tail
+		 * btrfs_truncate_block() just zeroed in the page cache, so
+		 * don't raise i_size again if anything below fails.
+		 */
+		control.last_size = inode->vfs_inode.i_size;
 		trans = btrfs_start_transaction(root, 1);
 		if (IS_ERR(trans)) {
 			ret = PTR_ERR(trans);
@@ -7962,6 +8054,9 @@ static int btrfs_truncate(struct btrfs_inode *inode, bool skip_writeback)
 	}
 out:
 	btrfs_block_rsv_release(fs_info, &rsv, (u64)-1, NULL);
+	if (ret && inode->vfs_inode.i_nlink)
+		btrfs_truncate_restore_size(inode, control.new_size,
+					    control.last_size);
 	/*
 	 * So if we truncate and then write and fsync we normally would just
 	 * write the extents that changed, which is a problem if we need to
